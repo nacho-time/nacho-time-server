@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  proxy:
+    build:
+      context: ./proxy-server
+      dockerfile: Dockerfile
+    container_name: nacho-proxy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - API_PROWLARR_BASEURL=http://prowlarr:9696
+      - OAUTH_DB_PATH=/data/oauth_tokens.db
+    env_file:
+      - .env
+    volumes:
+      - proxy-data:/data
+    ports:
+      - "8123:8000"
+    depends_on:
+      - redis
+      - prowlarr
+    restart: unless-stopped
+    networks:
+      - nacho-network
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - prowlarr-config:/config
+    ports:
+      - "9696:9696"
+    restart: unless-stopped
+    networks:
+      - nacho-network
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    networks:
+      - nacho-network
+
+networks:
+  nacho-network:
+    driver: bridge
+
+volumes:
+  prowlarr-config:
+  proxy-data:
