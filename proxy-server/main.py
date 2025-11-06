@@ -739,7 +739,9 @@ async def trakt_movies_trending(page: int = 1, limit: int = 20):
 			logger.info("Cached trending movies for %s seconds", ttl)
 		except Exception as e:
 			logger.warning("Cache storage error: %s", e)
-	
+
+	print(Response(content=content, status_code=status, headers=response_headers, media_type="application/json"))
+
 	return Response(content=content, status_code=status, headers=response_headers, media_type="application/json")
 
 
