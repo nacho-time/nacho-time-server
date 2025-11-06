@@ -440,7 +440,10 @@ def _filter_upstream_headers(headers: Dict[str, str]) -> Dict[str, str]:
 		"trailer",
 		"transfer-encoding",
 		"upgrade",
-		"Authorization"
+		"Authorization",
+		"Encoding",
+		"content-encoding",
+		"x-rate-limit"
 	}
 	return {k: v for k, v in headers.items() if k.lower() not in hop_by_hop}
 
@@ -722,6 +725,7 @@ async def trakt_movies_trending(page: int = 1, limit: int = 20):
 	content = resp.content
 	status = resp.status_code
 	response_headers = _filter_upstream_headers(dict(resp.headers))
+	print("DEBUG: Response headers:", response_headers)
 	
 	logger.info("Trakt trending movies upstream response: status=%s", status)
 	logger.info("Response body (first 500 bytes): %s", content[:500])
