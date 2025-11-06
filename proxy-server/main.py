@@ -113,7 +113,7 @@ class TokenRefreshMiddleware(BaseHTTPMiddleware):
 class AuthorizationMiddleware(BaseHTTPMiddleware):
 	async def dispatch(self, request: Request, call_next):
 		# Check if Authorization header exists
-		auth_header = request.headers.get("Nacho-Auth")
+		auth_header = request.headers.get("X-Nacho-Auth")
 		
 		if not auth_header:
 			logger.warning("Request blocked: Missing Authorization header from %s", request.client.host if request.client else "unknown")
