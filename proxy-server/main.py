@@ -831,7 +831,10 @@ async def trakt_proxy(full_path: str, request: Request):
 	if request.method not in ("GET", "HEAD") and "content-type" not in request.headers:
 		add_headers["Content-Type"] = "application/json"
 
+	
+
 	logger.info("Proxying to Trakt: %s", full_path)
+	logger.info("Trakt request body: %s", await request.body())
 	return await _proxy_request(TRAKT_BASE, full_path, request, add_headers=add_headers, use_tmdb_cache=False)
 
 
