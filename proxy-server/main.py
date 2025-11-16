@@ -7,6 +7,8 @@ import time
 import asyncio
 import sqlite3
 import json
+import hashlib
+import uuid
 from typing import Dict, Any
 from datetime import datetime
 
@@ -112,7 +114,14 @@ class TokenRefreshMiddleware(BaseHTTPMiddleware):
 # Middleware to check for Authorization Bearer token and strip it
 class AuthorizationMiddleware(BaseHTTPMiddleware):
 	async def dispatch(self, request: Request, call_next):
-		# Check if Authorization header exists
+		# Skip auth check for routes to the Nacho server (SolidStart app handles its own auth)
+		path = request.url.path
+		if not (path.startswith("/trakt") or path.startswith("/tmdb") or path.startswith("/prowlarr")):
+			# This is a request to the Nacho server, pass it through
+			logger.debug("Skipping auth check for Nacho server route: %s", path)
+			return await call_next(request)
+		
+		# Check if Authorization header exists for API routes
 		auth_header = request.headers.get("X-Nacho-Auth")
 		
 		if not auth_header:
@@ -154,20 +163,32 @@ TMDB_READ_ACCESS_TOKEN = os.getenv("API_TMDB_READ_ACCESS_TOKEN")
 PROWLARR_BASE = os.getenv("API_PROWLARR_BASEURL", "http://localhost:9696").rstrip("/")
 PROWLARR_API_KEY = os.getenv("API_PROWLARR_API_KEY")
 
+# Domain name for rewriting Prowlarr URLs in responses
+DOMAIN_NAME = os.getenv("DOMAIN_NAME", "http://localhost:8000").rstrip("/")
+
 # Redis configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+
+# TTL for cached Prowlarr download URLs (default 1 hour)
+PROWLARR_CACHE_TTL = int(os.getenv("PROWLARR_CACHE_TTL", "3600"))
+
+# TTL for cached Prowlarr search results (default 30 minutes)
+PROWLARR_SEARCH_CACHE_TTL = int(os.getenv("PROWLARR_SEARCH_CACHE_TTL", "1800"))
+
+# Nacho server configuration (SolidStart app)
+NACHO_SERVER_BASE = os.getenv("NACHO_SERVER_BASEURL", "http://localhost:3000").rstrip("/")
 
 
 # Startup info: log which important env vars were loaded (mask sensitive values)
 def _is_set(val: str | None) -> str:
 	return "yes" if val else "no"
 
-logger.info("Startup: TRAKT_BASE=%s TRAKT_CLIENT_ID_set=%s TRAKT_CLIENT_SECRET_set=%s TMDB_TOKEN_set=%s PROWLARR_BASE=%s PROWLARR_KEY_set=%s REDIS=%s:%s", 
+logger.info("Startup: TRAKT_BASE=%s TRAKT_CLIENT_ID_set=%s TRAKT_CLIENT_SECRET_set=%s TMDB_TOKEN_set=%s PROWLARR_BASE=%s PROWLARR_KEY_set=%s DOMAIN_NAME=%s REDIS=%s:%s NACHO_SERVER=%s", 
 	TRAKT_BASE, _is_set(TRAKT_CLIENT_ID), _is_set(TRAKT_CLIENT_SECRET), _is_set(TMDB_READ_ACCESS_TOKEN),
-	PROWLARR_BASE, _is_set(PROWLARR_API_KEY),
-	REDIS_HOST, REDIS_PORT)
+	PROWLARR_BASE, _is_set(PROWLARR_API_KEY), DOMAIN_NAME,
+	REDIS_HOST, REDIS_PORT, NACHO_SERVER_BASE)
 
 # Initialize SQLite database for OAuth tokens
 DB_PATH = os.getenv("OAUTH_DB_PATH", "oauth_tokens.db")
@@ -372,6 +393,164 @@ async def shutdown_event():
 	# Clear FastAPICache
 	await FastAPICache.clear()
 	logger.info("FastAPICache cleared on shutdown")
+
+
+async def _cache_prowlarr_url(url: str) -> str:
+	"""Cache a Prowlarr download URL and return a unique hash identifier.
+	
+	Args:
+		url: The full Prowlarr download URL with API key
+		
+	Returns:
+		A unique hash identifier for the cached URL
+	"""
+	# Generate a unique hash for this URL
+	url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+	
+	# Store in Redis with TTL
+	try:
+		redis_key = f"prowlarr:download:{url_hash}"
+		await FastAPICache.get_backend().set(redis_key, url, PROWLARR_CACHE_TTL)
+		logger.info("Cached Prowlarr URL with hash %s (TTL: %ds)", url_hash, PROWLARR_CACHE_TTL)
+	except Exception as e:
+		logger.error("Failed to cache Prowlarr URL: %s", e)
+		raise HTTPException(status_code=500, detail="Failed to cache download URL")
+	
+	return url_hash
+
+
+async def _get_cached_prowlarr_url(url_hash: str) -> str:
+	"""Retrieve a cached Prowlarr download URL by hash.
+	
+	Args:
+		url_hash: The unique hash identifier
+		
+	Returns:
+		The original Prowlarr download URL
+		
+	Raises:
+		HTTPException: If the URL is not found or expired
+	"""
+	try:
+		redis_key = f"prowlarr:download:{url_hash}"
+		cached_url = await FastAPICache.get_backend().get(redis_key)
+		
+		if not cached_url:
+			logger.warning("Prowlarr URL not found or expired for hash: %s", url_hash)
+			raise HTTPException(status_code=404, detail="Download link not found or expired")
+		
+		# Redis returns bytes, decode to string
+		if isinstance(cached_url, bytes):
+			cached_url = cached_url.decode('utf-8')
+		
+		logger.info("Retrieved cached Prowlarr URL for hash: %s", url_hash)
+		return cached_url
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error("Failed to retrieve cached Prowlarr URL: %s", e)
+		raise HTTPException(status_code=500, detail="Failed to retrieve download URL")
+
+
+async def _rewrite_prowlarr_urls(data: Any) -> Any:
+	"""Recursively rewrite Prowlarr download URLs in response data to use secure proxy endpoints.
+	
+	Instead of exposing Prowlarr URLs with API keys, this function:
+	1. Caches the original URL with API key in Redis with TTL
+	2. Returns a secure proxy URL like /prowlarr/getDownload/<hash>
+	
+	Only rewrites specific fields that contain download URLs according to Prowlarr API spec:
+	- guid: The download link
+	- downloadUrl: Alternative download URL field
+	- magnetUrl: Magnet link field (not rewritten if it's already a magnet: link)
+	"""
+	# Fields that should have their URLs rewritten (Prowlarr API standard fields)
+	URL_FIELDS = {"guid", "downloadUrl", "magnetUrl"}
+	
+	if isinstance(data, dict):
+		result = {}
+		for key, value in data.items():
+			# Only rewrite specific URL fields that contain Prowlarr URLs
+			if key in URL_FIELDS and isinstance(value, str):
+				# Don't rewrite magnet links - they don't contain API keys
+				if value.startswith("magnet:"):
+					result[key] = value
+				# Rewrite Prowlarr URLs to use secure cached endpoint
+				elif PROWLARR_BASE in value:
+					try:
+						# Cache the original URL and get a hash
+						url_hash = await _cache_prowlarr_url(value)
+						# Return secure proxy URL
+						result[key] = f"{DOMAIN_NAME}/prowlarr/getDownload/{url_hash}"
+						logger.debug("Rewrote %s URL: %s -> %s", key, value[:100], result[key])
+					except Exception as e:
+						logger.error("Failed to rewrite %s URL: %s", key, e)
+						# Fallback: remove the URL entirely rather than expose API key
+						result[key] = ""
+				else:
+					# URL doesn't contain Prowlarr base, keep as-is
+					result[key] = value
+			else:
+				# Recursively process nested structures
+				result[key] = await _rewrite_prowlarr_urls(value)
+		return result
+	elif isinstance(data, list):
+		return [await _rewrite_prowlarr_urls(item) for item in data]
+	else:
+		return data
+
+
+async def _get_from_prowlarr_with_cache(url: str, params: Dict[str, Any], headers: Dict[str, str]):
+	"""Fetch from Prowlarr with Redis caching for search results.
+	
+	Args:
+		url: The Prowlarr API URL
+		params: Query parameters
+		headers: Headers to send (including X-Api-Key)
+		
+	Returns:
+		Tuple of (status, headers, content, was_cached)
+	"""
+	# Create cache key based on URL and params (excluding API key from cache key)
+	cache_params = {k: v for k, v in params.items() if k.lower() != 'apikey'}
+	key = f"prowlarr:search:{_make_cache_key(url, cache_params)}"
+	
+	# Try to get from Redis cache
+	try:
+		cached_data = await FastAPICache.get_backend().get(key)
+		if cached_data:
+			logger.info("Prowlarr search cache HIT %s", key[:100])
+			# Parse the cached JSON data
+			cached = json.loads(cached_data)
+			return cached["status"], cached["headers"], cached["content"].encode(), True
+	except Exception as e:
+		logger.warning("Prowlarr search cache retrieval error: %s", e)
+
+	logger.info("Prowlarr search cache MISS %s — fetching %s params=%s", key[:100], url, cache_params)
+	client = get_client()
+	resp = await client.get(url, params=params, headers=headers)
+
+	content = resp.content
+	status = resp.status_code
+	# Copy headers we care about
+	response_headers = {k: v for k, v in resp.headers.items()}
+
+	# Cache only successful GET responses (200)
+	if resp.status_code == 200:
+		ttl = PROWLARR_SEARCH_CACHE_TTL
+		# Store as JSON for easy retrieval
+		cache_data = json.dumps({
+			"status": status,
+			"headers": response_headers,
+			"content": content.decode('utf-8', errors='replace')
+		})
+		try:
+			await FastAPICache.get_backend().set(key, cache_data, ttl)
+			logger.info("Cached Prowlarr search result with TTL=%ds", ttl)
+		except Exception as e:
+			logger.warning("Failed to cache Prowlarr search: %s", e)
+
+	return status, response_headers, content, False
 
 
 def _make_cache_key(url: str, params: Dict[str, Any]) -> str:
@@ -858,15 +1037,180 @@ async def tmdb_proxy(full_path: str, request: Request):
 async def prowlarr_proxy(full_path: str, request: Request):
 	"""Proxy all requests under /prowlarr/... to Prowlarr API.
 
-	Attaches the API key via X-Api-Key header. No caching is applied to Prowlarr requests.
+	Attaches the API key via X-Api-Key header. 
+	Search requests are cached in Redis to improve performance for duplicate searches.
+	For search results, rewrites URLs to use secure cached endpoints that don't expose API keys.
+	
+	Special endpoint: /prowlarr/getDownload/<hash> retrieves a cached download URL.
 	"""
+	# Handle the special secure download endpoint
+	if full_path.startswith("getDownload/"):
+		url_hash = full_path.replace("getDownload/", "")
+		logger.info("Fetching cached Prowlarr download URL for hash: %s", url_hash)
+		
+		# Retrieve the cached URL
+		cached_url = await _get_cached_prowlarr_url(url_hash)
+		
+		# Fetch the actual download using the cached URL
+		return await _prowlarr_download_fetch(cached_url, request)
+	
 	add_headers = {}
 	if PROWLARR_API_KEY:
 		add_headers["X-Api-Key"] = PROWLARR_API_KEY
 
 	logger.info("Proxying to Prowlarr: %s", full_path)
-	# No caching for Prowlarr
-	return await _proxy_request(PROWLARR_BASE, full_path, request, add_headers=add_headers, use_tmdb_cache=False)
+	
+	# Check if this is a search endpoint that should use caching
+	is_search = request.method == "GET" and ("/search" in full_path or "/api/v1/search" in full_path)
+	
+	if is_search:
+		# Use cached search for GET search requests
+		upstream_url = f"{PROWLARR_BASE}/{full_path.lstrip('/')}"
+		params = dict(request.query_params)
+		
+		try:
+			status, response_headers, content, was_cached = await _get_from_prowlarr_with_cache(
+				upstream_url, params, add_headers
+			)
+			
+			# Parse and rewrite URLs in the response
+			response_data = json.loads(content)
+			rewritten_data = await _rewrite_prowlarr_urls(response_data)
+			
+			logger.info("Rewrote Prowlarr URLs in search response with secure cached endpoints (cached=%s)", was_cached)
+			
+			# Exclude Content-Length header since JSONResponse will set it correctly
+			clean_headers = {k: v for k, v in response_headers.items() 
+			                if k.lower() not in ['content-length', 'transfer-encoding']}
+			
+			return JSONResponse(
+				content=rewritten_data,
+				status_code=status,
+				headers=clean_headers
+			)
+		except Exception as e:
+			logger.error("Failed to process cached Prowlarr search: %s", str(e))
+			# Fall back to non-cached request
+			logger.info("Falling back to non-cached request")
+	
+	# For non-search requests or fallback, use standard proxy
+	response = await _proxy_request(PROWLARR_BASE, full_path, request, add_headers=add_headers, use_tmdb_cache=False)
+	
+	# Check if this is an API endpoint that returns JSON with URLs to rewrite
+	if request.method == "GET" and "/api" in full_path:
+		try:
+			content_type = response.headers.get("content-type", "")
+			if "application/json" in content_type and hasattr(response, 'body'):
+				# Parse JSON response from the response body bytes
+				response_data = json.loads(response.body)
+				# Rewrite Prowlarr URLs to use secure cached endpoints
+				rewritten_data = await _rewrite_prowlarr_urls(response_data)
+				# Return modified response
+				logger.info("Rewrote Prowlarr URLs in API response with secure cached endpoints")
+				# Exclude Content-Length header since JSONResponse will set it correctly
+				response_headers = {k: v for k, v in response.headers.items() 
+				                   if k.lower() not in ['content-length', 'transfer-encoding']}
+				return JSONResponse(
+					content=rewritten_data,
+					status_code=response.status_code,
+					headers=response_headers
+				)
+		except Exception as e:
+			logger.error("Failed to rewrite Prowlarr URLs: %s", str(e))
+			# Return original response if rewriting fails
+	
+	return response
+
+
+async def _prowlarr_download_fetch(prowlarr_url: str, request: Request):
+	"""Fetch Prowlarr download URL to resolve redirect and return actual magnet/torrent.
+	
+	Args:
+		prowlarr_url: The full Prowlarr download URL (with API key)
+		request: The original request object
+	"""
+	client = get_client()
+	
+	# Build headers for the request
+	upstream_headers = {}
+	safe_headers = ["accept", "accept-encoding", "accept-language", "user-agent"]
+	for header_name in safe_headers:
+		if header_name in request.headers:
+			upstream_headers[header_name] = request.headers[header_name]
+	
+	logger.info("Fetching Prowlarr download URL: %s", prowlarr_url[:100])
+	
+	try:
+		# First, make a request without following redirects to check the redirect location
+		initial_resp = await client.get(
+			prowlarr_url,
+			headers=upstream_headers,
+			follow_redirects=False
+		)
+		
+		# Check if the redirect location is a magnet link
+		if initial_resp.status_code in [301, 302, 303, 307, 308]:
+			redirect_location = initial_resp.headers.get("location", "")
+			if redirect_location.startswith("magnet:"):
+				logger.info("Prowlarr returned magnet link directly: %s", redirect_location[:100])
+				# Return the magnet link as plain text
+				return Response(
+					content=redirect_location.encode('utf-8'),
+					status_code=200,
+					headers={"Content-Type": "text/plain"}
+				)
+		
+		# If not a magnet redirect, follow redirects to get the final content
+		resp = await client.get(
+			prowlarr_url,
+			headers=upstream_headers,
+			follow_redirects=True
+		)
+		
+		content = resp.content
+		status = resp.status_code
+		response_headers = _filter_upstream_headers(dict(resp.headers))
+		
+		# Check if we got a magnet link (text response starting with magnet:)
+		if status == 200 and content.startswith(b"magnet:"):
+			logger.info("Successfully fetched magnet link from Prowlarr (length: %s)", len(content))
+			response_headers["Content-Type"] = "text/plain"
+			return Response(content=content, status_code=status, headers=response_headers)
+		
+		# Check if we got a torrent file (binary content with application/x-bittorrent)
+		elif status == 200 and (
+			response_headers.get("content-type", "").startswith("application/x-bittorrent") or
+			response_headers.get("content-type", "").startswith("application/octet-stream")
+		):
+			logger.info("Successfully fetched torrent file from Prowlarr (size: %s bytes)", len(content))
+			return Response(content=content, status_code=status, headers=response_headers)
+		
+		# Otherwise return whatever we got
+		else:
+			logger.warning("Prowlarr download returned unexpected content type: %s, status: %s", 
+				response_headers.get("content-type"), status)
+			return Response(content=content, status_code=status, headers=response_headers)
+			
+	except Exception as e:
+		logger.error("Failed to fetch Prowlarr download: %s", str(e))
+		return JSONResponse(
+			status_code=500,
+			content={"error": "Failed to fetch download link", "message": str(e)}
+		)
+
+
+@app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def nacho_server_proxy(full_path: str, request: Request):
+	"""Proxy all other requests to the Nacho Time SolidStart server.
+	
+	This catch-all route handles any requests that don't match /trakt, /tmdb, or /prowlarr.
+	It forwards all requests to the SolidStart server running on localhost:3000.
+	"""
+	logger.info("Proxying to Nacho server: /%s", full_path)
+	
+	# Don't need to add any special headers, just forward the request as-is
+	# The AuthorizationMiddleware will still check for X-Nacho-Auth if configured
+	return await _proxy_request(NACHO_SERVER_BASE, full_path, request, add_headers=None, use_tmdb_cache=False)
 
 
 if __name__ == "__main__":

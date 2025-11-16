@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log
+.DS_Store
+.env
+.env.local
+.vinxi
+.output
+dist
+build
+*.log
+.git
+.gitignore
+README.md
+prisma/dev.db
+prisma/dev.db-journal
+prisma/migrations
