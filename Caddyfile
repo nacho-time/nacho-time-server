@@ -1,0 +1,3 @@
+nacho.mranzetti.com {
+    reverse_proxy localhost:8123
+}
