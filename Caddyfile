@@ -1,3 +1,7 @@
-nacho.mranzetti.com {
+nacho.yourdomain.com {
     reverse_proxy localhost:8123
+}
+
+prowlarr.yourdomain.com {
+    reverse_proxy localhost:9696
 }
