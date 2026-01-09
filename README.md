@@ -75,7 +75,7 @@ aa
 6. Edit the Caddyfile
 
    ```bash
-   sudo nano Caddyfile
+   nano Caddyfile
    ```
 
    Replace the contents with:
