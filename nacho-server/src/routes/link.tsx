@@ -3,18 +3,19 @@ import { useSubmission, createAsync, redirect } from "@solidjs/router";
 import { A, useSearchParams } from "@solidjs/router";
 import { getUser } from "~/lib";
 import { action } from "@solidjs/router";
-import { createAuthToken } from "~/lib/server";
+import { createAuthToken, getSession } from "~/lib/server";
 
 const linkDevice = action(async () => {
   "use server";
-  const user = await getUser();
+  const session = await getSession();
+  const userId = session.data.userId;
 
-  if (!user) {
+  if (userId === undefined) {
     throw redirect("/login?redirect=/link");
   }
 
   // Create a token with 1 year expiration (365 days)
-  const token = await createAuthToken(user.id, 365);
+  const token = await createAuthToken(userId, 365);
 
   return {
     success: true,

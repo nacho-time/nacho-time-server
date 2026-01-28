@@ -70,8 +70,14 @@ services:
     networks:
       - nacho-network
 
-      
-
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    ports:
+      - "8192:8191"
+    restart: unless-stopped
+    networks:
+      - nacho-network
 
 networks:
   nacho-network:
