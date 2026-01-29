@@ -22,7 +22,7 @@
     "@prisma/client": "^5.12.1",
     "@solidjs/router": "^0.15.0",
     "@solidjs/start": "^1.1.0",
-    "@tailwindcss/vite": "^4.1.17",
+    "@tailwindcss/vite": "^4.1.18",
     "argon2": "^0.44.0",
     "prisma": "^5.12.1",
     "solid-icons": "^1.1.0",
